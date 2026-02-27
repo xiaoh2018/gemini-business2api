@@ -94,6 +94,8 @@ class RefreshService:
         self._log_lock = threading.Lock()
         self._cancel_hooks: Dict[str, List[Callable[[], None]]] = {}
         self._cancel_hooks_lock = threading.Lock()
+        self._refresh_timestamps: Dict[str, float] = {}
+        self._triggered_today: set = set()
 
     # ---- logging helpers ----
 
@@ -217,8 +219,18 @@ class RefreshService:
             except Exception:
                 continue
 
-            if remaining <= config.basic.refresh_window_hours:
-                expiring.append(account_id)
+            if remaining > config.basic.refresh_window_hours:
+                continue
+
+            # Cooldown check: skip recently refreshed accounts
+            cooldown_seconds = config.retry.refresh_cooldown_hours * 3600
+            if account_id in self._refresh_timestamps:
+                elapsed = time.time() - self._refresh_timestamps[account_id]
+                if elapsed < cooldown_seconds:
+                    logger.debug(f"[REFRESH] skip {account_id}: refreshed {elapsed/3600:.1f}h ago, cooldown {config.retry.refresh_cooldown_hours}h")
+                    continue
+
+            expiring.append(account_id)
 
         return expiring
 
@@ -384,6 +396,7 @@ class RefreshService:
 
             if result.get("success"):
                 task.success_count += 1
+                self._refresh_timestamps[account_id] = time.time()
                 self._append_log(task, "info", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
                 self._append_log(task, "info", f"🎉 刷新成功: {account_id}")
                 self._append_log(task, "info", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -402,18 +415,11 @@ class RefreshService:
         task.finished_at = time.time()
         self._append_log(task, "info", f"🏁 刷新任务完成 (成功: {task.success_count}, 失败: {task.fail_count}, 总计: {len(task.account_ids)})")
 
-    # ---- check & refresh ----
+    # ---- run single batch ----
 
-    async def check_and_refresh(self) -> None:
-        """Check for expiring accounts and refresh them."""
-        expiring = self._get_expiring_accounts()
-        if not expiring:
-            logger.debug("[REFRESH] no accounts need refresh")
-            return
-
-        logger.info("[REFRESH] %d accounts need refresh: %s", len(expiring), expiring)
-
-        task = RefreshTask(id=str(uuid.uuid4()), account_ids=expiring)
+    async def _run_single_batch(self, account_ids: List[str]) -> RefreshTask:
+        """Run a single batch of accounts and wait for completion."""
+        task = RefreshTask(id=str(uuid.uuid4()), account_ids=account_ids)
         self._current_task = task
         task.status = TaskStatus.RUNNING
 
@@ -437,6 +443,77 @@ class RefreshService:
             self._save_task_history(task)
             self._current_task = None
 
+        return task
+
+    # ---- cron scheduling ----
+
+    @staticmethod
+    def _parse_cron(cron_str: str) -> dict:
+        """Parse cron expression.
+        Supports:
+          - '08:00,20:00' -> {'mode': 'daily', 'times': ['08:00', '20:00']}
+          - '*/120'       -> {'mode': 'interval', 'minutes': 120}
+        """
+        cron_str = cron_str.strip()
+        if cron_str.startswith("*/"):
+            try:
+                minutes = int(cron_str[2:])
+                return {"mode": "interval", "minutes": max(minutes, 5)}
+            except ValueError:
+                return {"mode": "interval", "minutes": 120}
+        else:
+            times = [t.strip() for t in cron_str.split(",") if t.strip()]
+            valid = []
+            for t in times:
+                parts = t.split(":")
+                if len(parts) == 2:
+                    try:
+                        h, m = int(parts[0]), int(parts[1])
+                        if 0 <= h <= 23 and 0 <= m <= 59:
+                            valid.append(f"{h:02d}:{m:02d}")
+                    except ValueError:
+                        pass
+            return {"mode": "daily", "times": valid or ["08:00", "20:00"]}
+
+    async def _wait_for_next_trigger(self) -> None:
+        """Wait for next trigger time.
+        - interval mode: wait N minutes
+        - daily mode: wait until next matching HH:MM, each time only triggers once per day
+        """
+        cron_str = config.retry.scheduled_refresh_cron
+        # Backward compat: if old field has value and new field is default, convert to interval
+        if (not cron_str or cron_str == "08:00,20:00") and config.retry.scheduled_refresh_interval_minutes > 0:
+            cron_str = f"*/{config.retry.scheduled_refresh_interval_minutes}"
+
+        cron = self._parse_cron(cron_str)
+
+        if cron["mode"] == "interval":
+            minutes = cron["minutes"]
+            logger.info(f"[REFRESH] interval mode: next check in {minutes} minutes")
+            await asyncio.sleep(minutes * 60)
+            return
+
+        # daily mode: check every 30 seconds
+        beijing_tz = timezone(timedelta(hours=8))
+        while self._is_polling:
+            now = datetime.now(beijing_tz)
+            current_time = now.strftime("%H:%M")
+            today_str = now.strftime("%Y-%m-%d")
+
+            # Clear old day's trigger records
+            old_keys = [k for k in self._triggered_today if not k.startswith(today_str)]
+            for k in old_keys:
+                self._triggered_today.discard(k)
+
+            for t in cron["times"]:
+                trigger_key = f"{today_str}_{t}"
+                if current_time == t and trigger_key not in self._triggered_today:
+                    self._triggered_today.add(trigger_key)
+                    logger.info(f"[REFRESH] daily trigger: {t}")
+                    return
+
+            await asyncio.sleep(30)
+
     # ---- polling loop ----
 
     async def start_polling(self) -> None:
@@ -446,7 +523,7 @@ class RefreshService:
             return
 
         self._is_polling = True
-        logger.info("[REFRESH] polling started")
+        logger.info("[REFRESH] smart refresh scheduler started")
         try:
             while self._is_polling:
                 # Hot-reload config from database each cycle
@@ -460,14 +537,45 @@ class RefreshService:
                     await asyncio.sleep(CONFIG_CHECK_INTERVAL_SECONDS)
                     continue
 
-                await self.check_and_refresh()
+                # Wait for next trigger time (cron or interval)
+                await self._wait_for_next_trigger()
+                if not self._is_polling:
+                    break
 
-                interval_seconds = config.retry.scheduled_refresh_interval_minutes * 60
-                logger.info(
-                    "[REFRESH] next check in %d minutes",
-                    config.retry.scheduled_refresh_interval_minutes,
-                )
-                await asyncio.sleep(interval_seconds)
+                # Get all expiring accounts (already cooldown-filtered)
+                expiring = self._get_expiring_accounts()
+                if not expiring:
+                    logger.info("[REFRESH] no accounts need refresh this round")
+                    continue
+
+                batch_size = config.retry.refresh_batch_size
+                total_batches = (len(expiring) + batch_size - 1) // batch_size
+                logger.info(f"[REFRESH] {len(expiring)} accounts to refresh, {total_batches} batches (batch size {batch_size})")
+
+                # Execute in batches
+                for i in range(0, len(expiring), batch_size):
+                    if not self._is_polling:
+                        break
+
+                    batch = expiring[i:i + batch_size]
+                    batch_num = i // batch_size + 1
+                    logger.info(f"[REFRESH] batch {batch_num}/{total_batches}: {batch}")
+
+                    try:
+                        task = await self._run_single_batch(batch)
+                        logger.info(f"[REFRESH] batch {batch_num} done (success: {task.success_count}, fail: {task.fail_count})")
+                    except Exception as exc:
+                        logger.warning(f"[REFRESH] batch {batch_num} error: {exc}")
+
+                    # Inter-batch wait (skip for last batch)
+                    remaining = expiring[i + batch_size:]
+                    if remaining and self._is_polling:
+                        interval = config.retry.refresh_batch_interval_minutes * 60
+                        logger.info(f"[REFRESH] waiting {config.retry.refresh_batch_interval_minutes} minutes before next batch...")
+                        await asyncio.sleep(interval)
+
+                logger.info("[REFRESH] refresh round complete")
+
         except asyncio.CancelledError:
             logger.info("[REFRESH] polling stopped")
         except Exception as exc:

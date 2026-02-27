@@ -62,7 +62,11 @@ class BasicConfig(BaseModel):
 class RetryConfig(BaseModel):
     """Refresh-related retry config"""
     scheduled_refresh_enabled: bool = Field(default=False, description="是否启用定时刷新任务")
-    scheduled_refresh_interval_minutes: int = Field(default=30, ge=0, le=720, description="定时刷新检测间隔（分钟）")
+    scheduled_refresh_cron: str = Field(default="08:00,20:00", description="刷新时间，如 '08:00,20:00' 或 '*/120'(每120分钟)")
+    refresh_batch_size: int = Field(default=5, ge=1, le=20, description="每批刷新账号数")
+    refresh_batch_interval_minutes: int = Field(default=30, ge=5, le=120, description="批次间等待时间(分钟)")
+    refresh_cooldown_hours: float = Field(default=12.0, ge=1, le=48, description="同一账号刷新冷却期(小时)")
+    scheduled_refresh_interval_minutes: int = Field(default=0, ge=0, le=720, description="(旧字段，已废弃) 定时刷新检测间隔")
 
 
 class WorkerConfig(BaseModel):

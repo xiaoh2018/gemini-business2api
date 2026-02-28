@@ -1176,6 +1176,14 @@
             <p class="text-xs text-muted-foreground">
               选中导出仅包含当前已勾选账号（{{ selectedCount }} 个）。
             </p>
+            <p class="text-xs text-muted-foreground">
+              <template v-if="exportFormat === 'json'">
+                JSON 格式包含完整数据（Cookie、Token、过期时间等），导入后无需重新刷新。
+              </template>
+              <template v-else>
+                TXT 格式仅导出邮箱和密码，导入后需要重新刷新获取 Cookie。
+              </template>
+            </p>
           </div>
         </div>
         <div class="border-t border-border/60 px-6 py-4">
@@ -1881,7 +1889,23 @@ const handleImportFile = async (event: Event) => {
       await accountsStore.updateConfig(next)
       selectedIds.value = new Set(importedIds)
       toast.success(`导入 ${importList.length} 条账号配置`)
-      closeRegisterModal()
+
+      // Check if imported accounts need refresh (no valid cookies)
+      const needRefresh = importList.some((item: any) => !item.secure_c_ses)
+      if (needRefresh && importedIds.length > 0) {
+        closeRegisterModal()
+        const confirmed = await confirmDialog.ask({
+          title: '导入成功',
+          message: `已导入 ${importedIds.length} 个账户。检测到部分账户缺少 Cookie，是否立即刷新？`,
+          confirmText: '立即刷新',
+          cancelText: '稍后手动刷新',
+        })
+        if (confirmed) {
+          await handleRefreshSelected()
+        }
+      } else {
+        closeRegisterModal()
+      }
       return
     }
 
